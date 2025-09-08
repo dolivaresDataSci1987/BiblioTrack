@@ -1,0 +1,991 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>📚 BiblioTrack — con guardado local</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      #error-overlay{position:fixed;inset:0;display:none;background:rgba(0,0,0,.6);color:#fff;z-index:9999}
+      #error-box{max-width:900px;margin:5vh auto;background:#111;border-radius:16px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.5);}
+      #error-box pre{white-space:pre-wrap;font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,"Liberation Mono","Courier New",monospace}
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jspdf-autotable@3.8.4/dist/jspdf.plugin.autotable.min.js"></script>
+  </head>
+  <body class="bg-white text-slate-900">
+    <div id="root"></div>
+    <div id="error-overlay">
+      <div id="error-box">
+        <h2 class="text-xl font-semibold mb-2">⚠️ Ha ocurrido un error en la app</h2>
+        <p class="text-sm opacity-80 mb-2">Copia este detalle si necesitas ayuda:</p>
+        <pre id="error-text" class="text-xs bg-black/50 p-3 rounded-lg overflow-auto"></pre>
+        <div class="mt-3 flex gap-2">
+          <button id="reload-btn" class="px-3 py-2 rounded-lg bg-white text-black">Recargar</button>
+          <button id="hide-btn" class="px-3 py-2 rounded-lg border border-white/30">Ocultar</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- React 18 UMD -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <!-- HTM (JSX-like sin Babel) -->
+    <script src="https://unpkg.com/htm@3.1.1/dist/htm.umd.js"></script>
+
+    <script>
+      // ======== Error overlay & guards ========
+      (function setupErrorOverlay(){
+        const overlay = document.getElementById('error-overlay');
+        const text = document.getElementById('error-text');
+        const show = (msg) => { text.textContent = String(msg || 'Error desconocido'); overlay.style.display='block'; console.error(msg); };
+        window.addEventListener('error', (e)=> { show(e?.error?.stack || e?.message || e); });
+        window.addEventListener('unhandledrejection', (e)=> { show(e?.reason?.stack || e?.reason?.message || e?.reason || e); });
+        document.getElementById('reload-btn').onclick = () => location.reload();
+        document.getElementById('hide-btn').onclick = () => overlay.style.display='none';
+        window.__showError = show; // por si lo queremos invocar manualmente
+      })();
+
+      const { useState, useEffect, useMemo, useRef } = React;
+      const html = htm.bind(React.createElement);
+
+      // ================= Utiles básicos =================
+      function uid() {
+        const year = new Date().getFullYear().toString().slice(-2);
+        const rand = Math.floor(100 + Math.random() * 900);
+        return `${year}-${rand}`;
+      }
+      // Storage keys renombrados a BiblioTrack
+      const STORAGE_KEY = "bibliotrack_libros_v1";
+      const WISHLIST_KEY = "bibliotrack_wishlist_v1";
+      const READING_KEY = "bibliotrack_readinglist_v1";
+
+      function sanitizeUrl(u) {
+        if (!u) return "";
+        let url = u.trim();
+        if (url && !/^https?:\/\//i.test(url)) url = "https://" + url;
+        if (url.startsWith("http:")) url = url.replace("http:", "https:");
+        return url;
+      }
+
+      // ================= IndexedDB (para guardar los handles) =================
+      const IDB_NAME = 'bibliotrack_fs_handles';
+      const IDB_STORE = 'handles';
+      function idbOpen() {
+        return new Promise((resolve, reject) => {
+          let req;
+          try{ req = indexedDB.open(IDB_NAME, 1); }catch(err){ return reject(err); }
+          req.onupgradeneeded = () => {
+            const db = req.result;
+            if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+          };
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+      }
+      async function idbSafePut(key, value) {
+        try {
+          const db = await idbOpen();
+          return await new Promise((resolve, reject) => {
+            const tx = db.transaction(IDB_STORE, 'readwrite');
+            tx.objectStore(IDB_STORE).put(value, key);
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => reject(tx.error);
+          });
+        } catch (e) {
+          console.warn('No se pudo persistir el handle en IDB (se continuará sin recordar la carpeta):', e);
+          return false;
+        }
+      }
+      async function idbGet(key) {
+        try{
+          const db = await idbOpen();
+          return await new Promise((resolve, reject) => {
+            const tx = db.transaction(IDB_STORE, 'readonly');
+            const req = tx.objectStore(IDB_STORE).get(key);
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+          });
+        } catch(e){ return null; }
+      }
+      async function idbDel(key) {
+        try {
+          const db = await idbOpen();
+          return await new Promise((resolve, reject) => {
+            const tx = db.transaction(IDB_STORE, 'readwrite');
+            tx.objectStore(IDB_STORE).delete(key);
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => reject(tx.error);
+          });
+        } catch(e){ return false; }
+      }
+
+      // ================= File System Access API (carpeta local) =================
+      const FS_DIR_KEY = 'fs_dir_handle_v1';
+      const FS_FILES = { libros: 'bibliotrack_libros.json', wishlist: 'bibliotrack_wishlist.json', reading: 'bibliotrack_lecturas.json' };
+
+      function fsAvailable(){
+        return !!(window.showDirectoryPicker && window.isSecureContext !== false);
+      }
+
+      async function verifyPermission(handle, opts = { mode: 'readwrite' }) {
+        if (!handle) return false;
+        try {
+          const q = await handle.queryPermission?.(opts);
+          if (q === 'granted') return true;
+        } catch {}
+        try {
+          const r = await handle.requestPermission?.(opts);
+          if (r === 'granted') return true;
+        } catch {}
+        return false;
+      }
+
+      async function ensureFiles(dirHandle) {
+        const out = {};
+        for (const [k, fname] of Object.entries(FS_FILES)) {
+          try {
+            out[k] = await dirHandle.getFileHandle(fname, { create: true });
+          } catch (e) {
+            console.error('No se pudo crear/abrir', fname, e);
+            throw e;
+          }
+        }
+        return out;
+      }
+
+      async function readJSONFromFile(fileHandle) {
+        try {
+          const file = await fileHandle.getFile();
+          const text = await file.text();
+          if (!text) return null;
+          try { return JSON.parse(text); } catch (parseErr) {
+            console.warn('JSON inválido, se ignorará ese archivo.', parseErr);
+            return null;
+          }
+        } catch (e) {
+          console.warn('Lectura JSON fallida', e);
+          return null;
+        }
+      }
+
+      async function writeJSONToFile(fileHandle, data) {
+        try {
+          const writable = await fileHandle.createWritable();
+          await writable.write(new Blob([JSON.stringify(data ?? [], null, 2)], { type: 'application/json' }));
+          await writable.close();
+          return true;
+        } catch (e) {
+          console.error('Escritura JSON fallida', e);
+          return false;
+        }
+      }
+
+      // ===================== APP =====================
+      function App() {
+        const [allowNet, setAllowNet] = useState(() => {
+          try { return localStorage.getItem('bibliotrack_allow_net') === '1'; }
+          catch { return false; }
+        });
+        useEffect(() => {
+          try { localStorage.setItem('bibliotrack_allow_net', allowNet ? '1' : '0'); } catch {}
+        }, [allowNet]);
+
+        const [items, setItems] = useState(() => {
+          try { const raw = localStorage.getItem(STORAGE_KEY); return raw ? JSON.parse(raw) : []; }
+          catch { return []; }
+        });
+
+        const [wishlist, setWishlist] = useState(() => {
+          try { return JSON.parse(localStorage.getItem(WISHLIST_KEY) || '[]'); } catch { return []; }
+        });
+        const [reading, setReading] = useState(() => {
+          try { return JSON.parse(localStorage.getItem(READING_KEY) || '[]'); } catch { return []; }
+        });
+        const [query, setQuery] = useState("");
+        const [editingId, setEditingId] = useState(null);
+        const [form, setForm] = useState({ titulo:"", autor:"", editorial:"", categoria:"", subcategoria:"", ubicacion:"", resumen:"", urlPortada:"", fechaCompra:"", rating:"" });
+
+        // ======= Conexión a carpeta local =======
+        const [dirHandle, setDirHandle] = useState(null);
+        const [fileHandles, setFileHandles] = useState({ libros: null, wishlist: null, reading: null });
+        const [fsStatus, setFsStatus] = useState('Desconectado');
+
+        async function connectFolder() {
+          if (!fsAvailable()){
+            alert('Tu navegador no soporta el acceso al sistema de archivos desde esta página. Ábrela con un servidor local (https:// o http://localhost).');
+            return;
+          }
+          try {
+            const handle = await window.showDirectoryPicker({ id: 'bibliotrack_dir', mode: 'readwrite' });
+            const ok = await verifyPermission(handle, { mode: 'readwrite' });
+            if (!ok) { alert('No se concedieron permisos.'); return; }
+            const files = await ensureFiles(handle);
+            setDirHandle(handle);
+            setFileHandles(files);
+            setFsStatus('Conectado');
+            await idbSafePut(FS_DIR_KEY, handle); // persistencia opcional
+            await loadFromDisk(handle, files);
+          } catch (e) {
+            console.warn('Conexión cancelada o fallida', e);
+            alert("No se pudo conectar la carpeta: " + (e && e.message ? e.message : e));
+          }
+        }
+
+        async function reconnectIfPossible() {
+          try {
+            const saved = await idbGet(FS_DIR_KEY);
+            if (!saved) return;
+            const ok = await verifyPermission(saved, { mode: 'readwrite' });
+            if (!ok) return;
+            const files = await ensureFiles(saved);
+            setDirHandle(saved);
+            setFileHandles(files);
+            setFsStatus('Conectado');
+            await loadFromDisk(saved, files);
+          } catch (e) {
+            console.warn('No se pudo reestablecer la conexión a la carpeta', e);
+          }
+        }
+
+        async function disconnectFolder() {
+          setDirHandle(null);
+          setFileHandles({ libros: null, wishlist: null });
+          setFsStatus('Desconectado');
+          try { await idbDel(FS_DIR_KEY); } catch {}
+        }
+
+        async function loadFromDisk(dh = dirHandle, fh = fileHandles) {
+          try {
+            if (!dh || !fh.libros || !fh.wishlist || !fh.reading) return;
+            const diskItems = await readJSONFromFile(fh.libros);
+            const diskWishlist = await readJSONFromFile(fh.wishlist);
+            const diskReading = await readJSONFromFile(fh.reading);
+            if (Array.isArray(diskItems)) setItems(diskItems);
+            if (Array.isArray(diskWishlist)) setWishlist(diskWishlist);
+            if (Array.isArray(diskReading)) setReading(diskReading);
+          } catch(e){
+            __showError('Error al leer desde disco: ' + (e?.message || e));
+          }
+        }
+
+        async function saveToDisk(force = false) {
+          if (!dirHandle || !fileHandles.libros || !fileHandles.wishlist || !fileHandles.reading) return false;
+          if (!(await verifyPermission(dirHandle, { mode: 'readwrite' }))) return false;
+          const ok1 = await writeJSONToFile(fileHandles.libros, items);
+          const ok2 = await writeJSONToFile(fileHandles.wishlist, wishlist);
+          const ok3 = await writeJSONToFile(fileHandles.reading, reading);
+          if (force && (!ok1 || !ok2)) alert('No se pudo guardar en disco.');
+          return ok1 && ok2 && ok3;
+        }
+
+        useEffect(() => { reconnectIfPossible(); }, []);
+        useEffect(() => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(items)); } catch {} }, [items]);
+        useEffect(() => { try { localStorage.setItem(WISHLIST_KEY, JSON.stringify(wishlist)); } catch {} }, [wishlist]);
+        useEffect(() => { try { localStorage.setItem(READING_KEY, JSON.stringify(reading)); } catch {} }, [reading]);
+
+        const saveDebounceRef = useRef(null);
+        useEffect(() => {
+          if (!dirHandle) return;
+          if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+          saveDebounceRef.current = setTimeout(() => { saveToDisk(false); }, 400);
+          return () => saveDebounceRef.current && clearTimeout(saveDebounceRef.current);
+        }, [items, wishlist, reading, reading, dirHandle]);
+
+        useEffect(() => {
+          setItems(prev => {
+            let changed = false;
+            const used = new Set(prev.map(x => x.id).filter(Boolean));
+            const out = prev.map(x => {
+              const m = { ...x };
+              if (!m.id) { let nid = uid(); while (used.has(nid)) nid = uid(); m.id = nid; used.add(nid); changed = true; }
+              if (!m.fecha) { m.fecha = new Date().toISOString(); changed = true; }
+              if (m.coverUrl && !m.portada) { m.portada = m.coverUrl; changed = true; }
+              return m;
+            });
+            if (changed) {
+              try { localStorage.setItem(STORAGE_KEY, JSON.stringify(out)); } catch {}
+              return out;
+            }
+            return prev;
+          });
+        }, []);
+
+        function resetForm() {
+          setForm({ titulo:"", autor:"", editorial:"", categoria:"", subcategoria:"", ubicacion:"", resumen:"", urlPortada:"", fechaCompra:"", rating:"" });
+        }
+
+        function addItem(e) {
+          e.preventDefault();
+          const trimmed = Object.fromEntries(Object.entries(form).map(([k,v]) => [k, (v||"").trim()]));
+          if (!trimmed.titulo || !trimmed.autor) { alert("Añade al menos Título y Autor."); return; }
+          const portada = trimmed.urlPortada ? sanitizeUrl(trimmed.urlPortada) : null;
+          let newId = uid();
+          while (items.some(x => x.id === newId)) newId = uid();
+          const entry = { id: newId, fecha: new Date().toISOString(), portada, ...trimmed };
+          delete entry.urlPortada;
+          setItems(prev => [entry, ...prev]);
+          resetForm();
+        }
+
+        function startEdit(id) {
+          const it = items.find(x => x.id === id);
+          if (!it) return;
+          setEditingId(id);
+          setForm({
+            titulo: it.titulo || "",
+            autor: it.autor || "",
+            editorial: it.editorial || "",
+            categoria: it.categoria || "",
+            subcategoria: it.subcategoria || "",
+            ubicacion: it.ubicacion || "",
+            resumen: it.resumen || "",
+            urlPortada: it.portada || "",
+            fechaCompra: it.fechaCompra || "",
+            rating: it.rating || ""
+          });
+        }
+
+        function saveEdit(e) {
+          e.preventDefault();
+          const trimmed = Object.fromEntries(Object.entries(form).map(([k,v]) => [k, (v||"").trim()]));
+          const portada = trimmed.urlPortada ? sanitizeUrl(trimmed.urlPortada) : undefined;
+          delete trimmed.urlPortada;
+          setItems(prev => prev.map(x => x.id===editingId ? ({ ...x, ...trimmed, ...(portada!==undefined?{portada}:{}) }) : x));
+          setEditingId(null);
+          resetForm();
+        }
+        function cancelEdit() { setEditingId(null); resetForm(); }
+        function removeItemBy(id, idx) {
+          setItems(prev => {
+            if (id && prev.some(x=>x.id===id)) return prev.filter(x=>x.id!==id);
+            if (typeof idx === "number") return prev.filter((_,i)=>i!==idx);
+            return prev;
+          });
+        }
+
+        // ======= Lista de deseos =======
+        const [showWishlist, setShowWishlist] = useState(false);
+        const [wishForm, setWishForm] = useState({ wtitulo:"", wautor:"", weditorial:"", wprecio:"", wlink:"" });
+        function resetWishForm(){ setWishForm({ wtitulo:"", wautor:"", weditorial:"", wprecio:"", wlink:"" }); }
+        function addWish(e){
+          e.preventDefault();
+          const f = Object.fromEntries(Object.entries(wishForm).map(([k,v]) => [k, (v||"").trim()]));
+          if(!f.wtitulo){ return; }
+          const link = f.wlink ? sanitizeUrl(f.wlink) : "";
+          const newWish = { id: 'W-' + Date.now(), titulo: f.wtitulo, autor: f.wautor, editorial: f.weditorial, precio: f.wprecio, link, fecha: new Date().toISOString().slice(0,10) };
+          setWishlist(prev => [newWish, ...prev]);
+          resetWishForm();
+        }
+        function removeWish(id){ setWishlist(prev => prev.filter(w => w.id !== id)); }
+        // ======= Club de lectura (lecturas en curso) =======
+        function addReadingById(id){
+          if (!id) return;
+          setReading(prev => prev.includes(id) ? prev : [id, ...prev]);
+        }
+        function removeReadingById(id){
+          setReading(prev => prev.filter(x => x !== id));
+        }
+
+        // ======= Carrusel =======
+        const covers = useMemo(() => (items || []).filter(x => !!x.portada), [items]);
+        const trackRef = useRef(null);
+        const scrollByPx = 260;
+        const nextCover = () => { try { trackRef.current?.scrollBy({ left: scrollByPx, behavior: 'smooth' }); } catch {} };
+        const prevCover = () => { try { trackRef.current?.scrollBy({ left: -scrollByPx, behavior: 'smooth' }); } catch {} };
+
+        // ======= Contadores =======
+        const totalLibros = items.length;
+        const autoresUnicos = useMemo(() => {
+          const s = new Set((items||[]).map(x => (x.autor||"").trim().toLowerCase()).filter(Boolean));
+          return s.size;
+        }, [items]);
+
+        // ======= Backup / Importación JSON =======
+        async function importJSON(kind){
+          try {
+            const picker = document.createElement('input');
+            picker.type = 'file';
+            picker.accept = '.json,application/json';
+            picker.click();
+            const file = await new Promise((res, rej) => {
+              picker.onchange = () => res(picker.files && picker.files[0]);
+              setTimeout(()=>{},0);
+            });
+            if (!file) return;
+            const text = await file.text();
+            const data = JSON.parse(text);
+            if (!Array.isArray(data)) { alert('El JSON debe ser un array'); return; }
+            if (kind === 'items') setItems(data);
+            if (kind === 'wishlist') setWishlist(data);
+            if (kind === 'reading') setReading(data);
+            alert('Datos importados correctamente.');
+          } catch(e){
+            console.error(e);
+            alert('No se pudo importar: ' + (e?.message || e));
+          }
+        }
+        function exportJSON(kind){
+          try{
+            const payload = kind === 'items' ? items : kind === 'wishlist' ? wishlist : reading;
+            const name = kind === 'items' ? 'bibliotrack_libros.json' : kind === 'wishlist' ? 'bibliotrack_wishlist.json' : 'bibliotrack_lecturas.json';
+            const blob = new Blob([JSON.stringify(payload ?? [], null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = name; document.body.appendChild(a); a.click();
+            setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); },0);
+          }catch(e){
+            console.error(e); alert('No se pudo exportar.');
+          }
+        }
+        // ======= Export CSV =======
+        const allFields = ["id","titulo","autor","editorial","categoria","subcategoria","ubicacion","fecha","fechaCompra","rating","portada","resumen"];
+        const [selectedFields, setSelectedFields] = useState(allFields.slice());
+        const [showFieldPicker, setShowFieldPicker] = useState(false);
+        function downloadBlob(content, filename, mime) {
+          try {
+            const blob = new Blob([content], { type: mime });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url; a.download = filename; document.body.appendChild(a); a.click();
+            setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
+          } catch (e) { console.error("Descarga fallida", e); alert("No se pudo generar la descarga."); }
+        }
+        function toCSV(arr, fields, delimiter = ";") {
+          const esc = (v) => {
+            if (v === null || v === undefined) return '""';
+            const s = String(v).replace(/"/g,'""').replace(/\r?\n/g, " ");
+            return '"' + s + '"';
+          };
+          const header = fields.join(delimiter);
+          const rows = arr.map(it => fields.map(k => esc(it[k])).join(delimiter));
+          return [header, ...rows].join("\n");
+        }
+        function downloadCSV() {
+          if (!selectedFields.length) { alert("Selecciona al menos un campo."); return; }
+          const csv = toCSV(items, selectedFields, ";");
+          downloadBlob(csv, "bibliotrack.csv", "text/csv;charset=utf-8;");
+        }
+        function toggleField(f) { setSelectedFields(prev => prev.includes(f) ? prev.filter(x=>x!==f) : [...prev, f]); }
+        function toggleAllFields() { setSelectedFields(prev => prev.length === allFields.length ? [] : allFields.slice()); }
+
+        const [selected, setSelected] = useState(null);
+        const [showAddReading, setShowAddReading] = useState(false);
+        const [selectedReadingId, setSelectedReadingId] = useState("");
+
+        const inputCls = "border rounded-xl px-3 py-2 outline-none focus:ring-2 focus:ring-slate-300";
+        const btnCls = "px-3 py-2 rounded-xl border shadow-sm hover:bg-slate-50";
+        const btnPrimary = "px-4 py-2 rounded-xl bg-slate-900 text-white";
+
+        // ======= Filtro + paginado =======
+        const filtered = useMemo(() => {
+          const q = query.toLowerCase();
+          const arr = q ? items.filter(x => [x.titulo,x.autor,x.categoria,x.subcategoria,x.ubicacion].some(v => (v||"").toLowerCase().includes(q))) : items;
+          return [...arr];
+        }, [items, query]);
+        const PAGE_SIZE = 20;
+        const [page, setPage] = useState(0);
+        const totalPages = Math.ceil(filtered.length / PAGE_SIZE) || 1;
+        useEffect(() => { if (page >= totalPages) setPage(0); }, [filtered.length, totalPages]);
+        const paged = useMemo(() => { const start = page * PAGE_SIZE; return filtered.slice(start, start + PAGE_SIZE); }, [filtered, page]);
+        const canPrev = page > 0;
+        const canNext = page < (totalPages - 1);
+        const goPrev = () => { if (canPrev) setPage(p => Math.max(0, p - 1)); };
+        const goNext = () => { if (canNext) setPage(p => Math.min(totalPages - 1, p + 1)); };
+
+        // ======= Descargar PDF del catálogo =======
+        function downloadPDF(){
+          try {
+            const { jsPDF } = window.jspdf || {};
+            if (!jsPDF || !window.jspdf || !('autoTable' in (jsPDF.API || {}))) {
+              alert("No se pudo cargar jsPDF. Comprueba tu conexión o vuelve a abrir el archivo.");
+              return;
+            }
+            const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+            const title = "Catálogo de títulos — BiblioTrack";
+            doc.setFontSize(14);
+            doc.text(title, 40, 40);
+
+            const head = [[
+              "Código","Título","Autor","Editorial","Categoría","Subcategoría","Ubicación","Fecha de compra","Rating"
+            ]];
+
+            const body = (items || []).map(it => [
+              it.id || "",
+              it.titulo || "",
+              it.autor || "",
+              it.editorial || "",
+              it.categoria || "",
+              it.subcategoria || "",
+              it.ubicacion || "",
+              it.fechaCompra || "",
+              (it.rating ? String(it.rating) : "")
+            ]);
+
+            doc.autoTable({
+              head,
+              body,
+              startY: 60,
+              tableWidth: 'auto',
+              styles: { fontSize: 7, cellPadding: 2, overflow: 'linebreak' },
+              headStyles: { fillColor: [226,232,240], textColor: [15,23,42], fontStyle: 'bold', fontSize: 8 },
+              columnStyles: {
+                0: { cellWidth: 50 },  // Código
+                1: { cellWidth: 170 }, // Título
+                2: { cellWidth: 110 }, // Autor
+                3: { cellWidth: 95 },  // Editorial
+                4: { cellWidth: 80 },  // Categoría
+                5: { cellWidth: 85 },  // Subcategoría
+                6: { cellWidth: 70 },  // Ubicación
+                7: { cellWidth: 70 },  // Fecha compra
+                8: { cellWidth: 30 }   // Rating
+              },
+              margin: { left: 40, right: 40 }
+            });
+
+            doc.save("catalogo_bibliotrack.pdf");
+          } catch(e){
+            console.error(e);
+            alert("No se pudo generar el PDF: " + (e && e.message ? e.message : e));
+          }
+        }
+
+        // ======= Descargar PDF de la lista de deseos =======
+        function downloadWishlistPDF(){
+          try {
+            const { jsPDF } = window.jspdf || {};
+            if (!jsPDF || !window.jspdf || !('autoTable' in (jsPDF.API || {}))) {
+              alert("No se pudo cargar jsPDF. Comprueba tu conexión o vuelve a abrir el archivo.");
+              return;
+            }
+            if (!wishlist || wishlist.length === 0) {
+              alert("No hay libros en la lista de deseos.");
+              return;
+            }
+            const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+            doc.setFontSize(14);
+            doc.text("Lista de deseos — BiblioTrack", 40, 40);
+
+            const head = [[ "Título", "Autor", "Editorial", "Precio", "Tienda (URL)" ]];
+            const body = wishlist.map(w => [
+              w.titulo || "",
+              w.autor || "—",
+              w.editorial || "—",
+              w.precio || "—",
+              w.link || "—"
+            ]);
+
+            doc.autoTable({
+              head, body,
+              startY: 60,
+              styles: { fontSize: 7, cellPadding: 2, overflow: 'linebreak' },
+              headStyles: { fillColor: [226,232,240], textColor: [15,23,42], fontStyle: 'bold', fontSize: 8 },
+              columnStyles: {
+                0: { cellWidth: 220 }, // Título
+                1: { cellWidth: 120 }, // Autor
+                2: { cellWidth: 110 }, // Editorial
+                3: { cellWidth: 70  }, // Precio
+                4: { cellWidth: 220 }  // Tienda (URL)
+              },
+              margin: { left: 40, right: 40 }
+            });
+
+            doc.save("lista_deseos_bibliotrack.pdf");
+          } catch (e) {
+            console.error(e);
+            alert("No se pudo generar el PDF de la lista de deseos: " + (e?.message || e));
+          }
+        }
+
+        return html`
+          <div className="min-h-screen bg-white text-slate-900 p-6">
+            <div className="max-w-6xl mx-auto">
+              <div className="flex justify-start mb-4">
+                <img src="logo.png" alt="BiblioTrack logo" className="w-36 h-auto"/>
+              </div>
+              <h1 className="text-3xl font-bold mb-2">📚 BiblioTrack</h1>
+
+              <!-- Estado y controles de carpeta local -->
+              <div className="mb-4 p-3 rounded-xl border bg-slate-50 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                <div className="text-sm">
+                  <div><strong>Carpeta local:</strong> ${dirHandle ? 'Conectada ✅' : 'No conectada'}</div>
+                  <div><strong>Guardado:</strong> ${dirHandle ? 'Auto-guardado activo' : 'Sólo copia de seguridad en el navegador'}</div>
+                  <div className="text-[12px] text-slate-500">Consejo: crea una carpeta en el Escritorio llamada <code>BiblioTrack</code> y selecciónala.</div>
+                </div>
+                <div className="flex gap-2">
+                  ${!dirHandle && html`<button className=${btnPrimary} onClick=${connectFolder}>Conectar carpeta local…</button>`}
+                  ${dirHandle && html`<${React.Fragment}>
+                    <button className=${btnCls} onClick=${() => saveToDisk(true)}>Forzar guardado ahora</button>
+                    <button className=${btnCls} onClick=${() => loadFromDisk()}>Leer desde disco</button>
+                    <button className=${btnCls + ' text-red-600'} onClick=${disconnectFolder}>Desconectar</button>
+                  </${React.Fragment}>`}
+                </div>
+              </div>
+
+              <!-- Privacidad / portadas -->
+              <div className="mb-4 p-3 rounded-xl border bg-slate-50 flex items-center justify-between gap-3">
+                <div className="text-sm text-slate-700">
+                  <strong>Privacidad:</strong> la app <em>no</em> hace peticiones de red automáticamente. Para ver portadas (imágenes remotas), actívalo aquí.
+                </div>
+                <label className="flex items-center gap-2 text-sm">
+                  <input type="checkbox" checked=${allowNet} onChange=${e=>setAllowNet(e.target.checked)} />
+                  Habilitar carga de portadas (usa red)
+                </label>
+              </div>
+
+              <!-- Contadores -->
+              <div className="mb-4 grid grid-cols-2 gap-3">
+                <div className="rounded-2xl border bg-white shadow p-4 text-center">
+                  <div className="text-xs uppercase tracking-wide text-slate-500">Libros</div>
+                  <div className="text-2xl font-semibold">${totalLibros}</div>
+                </div>
+                <div className="rounded-2xl border bg-white shadow p-4 text-center">
+                  <div className="text-xs uppercase tracking-wide text-slate-500">Autores</div>
+                  <div className="text-2xl font-semibold">${autoresUnicos}</div>
+                </div>
+              </div>
+
+              <!-- Aviso si no hay datos -->
+              ${(items.length===0 && wishlist.length===0) && html`
+                <div className="mb-4 p-3 rounded-xl border bg-amber-50 text-amber-900">
+                  <div className="font-semibold mb-1">Tu app aparece vacía</div>
+                  <div className="text-sm">
+                    Si abriste este archivo con otro nombre o ruta (<code>file://</code> distinto), el navegador usa un almacenamiento diferente
+                    y por eso no ves tus datos previos. Opciones:
+                    <ul className="list-disc pl-5 mt-1">
+                      <li>Conectar tu carpeta local y leer <code>${FS_FILES.libros}</code> / <code>${FS_FILES.wishlist}</code>.</li>
+                      <li>Importar tus copias en JSON con los botones de abajo.</li>
+                    </ul>
+                  </div>
+                </div>
+              `}
+
+              <!-- Botón toggle de Lista de deseos -->
+              <div className="mt-2">
+                <button className="px-3 py-2 rounded-xl bg-indigo-600 text-white hover:opacity-90" onClick=${() => setShowWishlist(v => !v)}>
+                  ${showWishlist ? "Ocultar" : "Mostrar"} lista de deseos
+                </button>
+              </div>
+
+              <!-- Lista de deseos (colapsable) -->
+              <div className="my-6">
+                ${showWishlist && html`
+                  <div className="mt-4 p-4 border rounded-xl bg-white/50 shadow-sm">
+                    <h3 className="text-lg font-semibold mb-2">📚 Lista de deseos</h3>
+                    <div className="mb-3">
+                      <button
+                        className="px-3 py-2 rounded-xl bg-slate-900 text-white hover:opacity-90"
+                        onClick=${downloadWishlistPDF}
+                        title="Descargar PDF de la lista de deseos"
+                      >
+                        Descargar PDF
+                      </button>
+                    </div>
+
+                    <form className="grid grid-cols-1 md:grid-cols-5 gap-3 items-start" onSubmit=${addWish}>
+                      <input className=${inputCls} placeholder="Título" value=${wishForm.wtitulo} onChange=${e=>setWishForm(f=>({...f,wtitulo:e.target.value}))} />
+                      <input className=${inputCls} placeholder="Autor" value=${wishForm.wautor} onChange=${e=>setWishForm(f=>({...f,wautor:e.target.value}))} />
+                      <input className=${inputCls} placeholder="Editorial" value=${wishForm.weditorial} onChange=${e=>setWishForm(f=>({...f,weditorial:e.target.value}))} />
+                      <input className=${inputCls} placeholder="Precio (ej. 12,99 €)" value=${wishForm.wprecio} onChange=${e=>setWishForm(f=>({...f,wprecio:e.target.value}))} />
+                      <input className=${inputCls} placeholder="Link de compra (https://...)" value=${wishForm.wlink} onChange=${e=>setWishForm(f=>({...f,wlink:e.target.value}))} />
+                      <div className="md:col-span-5 flex gap-2">
+                        <button className="px-3 py-2 rounded-xl bg-emerald-600 text-white hover:opacity-90" type="submit">Añadir</button>
+                        <button type="button" className="px-3 py-2 rounded-xl border hover:bg-black/5" onClick=${resetWishForm}>Limpiar</button>
+                      </div>
+                    </form>
+
+                    <div className="mt-4 overflow-x-auto">
+                      <table className="min-w-full bg-white rounded-lg overflow-hidden shadow">
+                        <thead>
+                          <tr className="bg-gray-100">
+                            <th className="p-3 text-sm font-semibold">Título</th>
+                            <th className="p-3 text-sm font-semibold">Autor</th>
+                            <th className="p-3 text-sm font-semibold">Editorial</th>
+                            <th className="p-3 text-sm font-semibold">Precio</th>
+                            <th className="p-3 text-sm font-semibold">Link</th>
+                            <th className="p-3 text-sm font-semibold">Fecha</th>
+                            <th className="p-3 text-sm font-semibold">Acciones</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          ${wishlist.length === 0 ? html`
+                            <tr><td className="p-3 text-center text-sm text-gray-500" colSpan="7">No hay libros en la lista de deseos.</td></tr>
+                          ` : wishlist.map(w => html`
+                            <tr className="border-t">
+                              <td className="p-3">${w.titulo}</td>
+                              <td className="p-3">${w.autor || "—"}</td>
+                              <td className="p-3">${w.editorial || "—"}</td>
+                              <td className="p-3">${w.precio || "—"}</td>
+                              <td className="p-3">${w.link ? html`<a className="text-indigo-700 underline break-all" href="${w.link}" target="_blank" rel="noopener">Abrir</a>` : "—"}</td>
+                              <td className="p-3">${w.fecha || "—"}</td>
+                              <td className="p-3"><button className="px-2 py-1 rounded-lg border hover:bg-black/5" onClick=${() => removeWish(w.id)}>Eliminar</button></td>
+                            </tr>
+                          `)}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                `}
+              </div>
+
+              <!-- Carrusel de portadas -->
+              <div className="mt-6">
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className="text-lg font-semibold">Portadas de la colección</h3>
+                  <div className="flex items-center gap-2">
+                    <button className=${btnCls} onClick=${prevCover} title="Anterior" aria-label="Anterior">◀</button>
+                    <button className=${btnCls} onClick=${nextCover} title="Siguiente" aria-label="Siguiente">▶</button>
+                  </div>
+                </div>
+                ${covers.length === 0 ? html`
+                  <div className="text-sm text-slate-500">No hay portadas para mostrar. ${allowNet ? "" : "Activa la carga de portadas para ver imágenes."}</div>
+                ` : html`
+                  <div className="w-full rounded-2xl border bg-white shadow p-4">
+                    <div ref=${trackRef} className="flex gap-4 overflow-x-auto snap-x snap-mandatory scroll-smooth pb-2">
+                      ${covers.map(c => html`
+                        <div className="shrink-0 snap-start">
+                          <button className="block focus:outline-none cursor-pointer" onClick=${() => setSelected(c)} title="Ver ficha" aria-label="Ver ficha del libro">
+                            ${allowNet
+                              ? html`<img src=${c.portada} alt=${c.titulo || "Portada"} className="h-48 w-32 md:h-56 md:w-40 object-cover rounded-lg border" loading="lazy" referrerPolicy="no-referrer" />`
+                              : html`<div className="h-48 w-32 md:h-56 md:w-40 rounded-lg border text-[10px] text-slate-400 flex items-center justify-center text-center px-1">Carga de portadas desactivada</div>`}
+                          </button>
+                        </div>
+                      `)}
+                    </div>
+                  </div>
+                `}
+              </div>
+
+              <!-- Club de lectura -->
+              ${html`
+              <div className="mt-8">
+                <h3 className="text-xl font-semibold mb-1">📚 Club de lectura</h3>
+                <p className="text-sm text-slate-600 mb-3">¿Qué estás leyendo ahora?</p>
+                <div className="mb-3 flex items-center gap-2">
+                  <button className=${btnPrimary} onClick=${() => setShowAddReading(v => !v)} aria-label="Agregar lectura en curso">+ Añadir lectura</button>
+                  ${reading.length ? html`<span className="text-sm text-slate-600">Leyendo ${reading.length} ${reading.length===1?'título':'títulos'}</span>` : ''}
+                </div>
+                ${showAddReading && html`
+                  <div className="flex flex-col sm:flex-row gap-2 items-start sm:items-center mb-4">
+                    <select className=${inputCls} value=${selectedReadingId} onChange=${e => setSelectedReadingId(e.target.value)}>
+                      <option value="">— Selecciona un título —</option>
+                      ${items
+                        .filter(b => !reading.includes(b.id))
+                        .map(b => html`<option key=${b.id} value=${b.id}>${b.titulo} — ${b.autor}</option>`)}
+                    </select>
+                    <div className="flex gap-2">
+                      <button className=${btnPrimary} onClick=${() => { if(selectedReadingId){ addReadingById(selectedReadingId); setSelectedReadingId(""); setShowAddReading(false);} }}>Agregar</button>
+                      <button className=${btnCls} onClick=${() => { setSelectedReadingId(""); setShowAddReading(false); }}>Cancelar</button>
+                    </div>
+                  </div>
+                `}
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  ${reading.length === 0 ? html`
+                    <div className="text-sm text-slate-500">No hay lecturas en curso. Usa “Añadir lectura” para empezar.</div>
+                  ` : reading.map(rid => {
+                      const bk = items.find(x => x.id === rid);
+                      if (!bk) return null;
+
+                      return html`
+                        <div key=${rid} className="rounded-2xl border bg-white shadow p-4 flex gap-3 items-center">
+                          <div className="w-16 h-24 rounded-md border bg-slate-100 flex items-center justify-center overflow-hidden shrink-0">
+                            ${allowNet && bk.portada
+                              ? html`<img src=${bk.portada} alt=${bk.titulo} className="object-cover w-full h-full" loading="lazy" referrerPolicy="no-referrer" />`
+                              : html`<span className="text-[10px] text-slate-400">Sin portada</span>`}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="font-semibold truncate">${bk.titulo || "—"}</div>
+                            <div className="text-sm text-slate-600 truncate">${bk.autor || "—"}</div>
+                            <div className="mt-2">
+                              <button className=${btnCls + " text-emerald-700"} onClick=${() => removeReadingById(rid)}>✔ Lectura completada</button>
+                            </div>
+                          </div>
+                        </div>
+                      `;
+                  })}
+                </div>
+              </div>
+              `}
+
+              <h3 className="text-xl font-semibold mt-8 mb-2">➕ Cargar un nuevo título</h3>
+              <form onSubmit=${editingId?saveEdit:addItem} className="grid gap-2 mb-4 bg-white rounded-2xl shadow p-4">
+                <input className=${inputCls} placeholder="Título" value=${form.titulo} onChange=${e=>setForm(f=>({...f,titulo:e.target.value}))} required />
+                <input className=${inputCls} placeholder="Autor" value=${form.autor} onChange=${e=>setForm(f=>({...f,autor:e.target.value}))} required />
+                <input className=${inputCls} placeholder="Editorial" value=${form.editorial} onChange=${e=>setForm(f=>({...f,editorial:e.target.value}))} />
+                <input className=${inputCls} placeholder="Categoría" value=${form.categoria} onChange=${e=>setForm(f=>({...f,categoria:e.target.value}))} />
+                <input className=${inputCls} placeholder="Subcategoría" value=${form.subcategoria||""} onChange=${e=>setForm(f=>({...f,subcategoria:e.target.value}))} />
+                <input className=${inputCls} placeholder="Ubicación (estantería, caja, etc.)" value=${form.ubicacion||""} onChange=${e=>setForm(f=>({...f,ubicacion:e.target.value}))} />
+                <textarea className=${inputCls} placeholder="Resumen" value=${form.resumen} onChange=${e=>setForm(f=>({...f,resumen:e.target.value}))} />
+                <input className=${inputCls} placeholder="URL directa de la portada (https://…/cover.jpg)" value=${form.urlPortada} onChange=${e=>setForm(f=>({...f,urlPortada:e.target.value}))} />
+                <input type="date" className=${inputCls} value=${form.fechaCompra} onChange=${e=>setForm(f=>({...f,fechaCompra:e.target.value}))} />
+                <label className="text-sm">Calificación ⭐
+                  <select className=${inputCls+" ml-2"} value=${form.rating} onChange=${e=>setForm(f=>({...f,rating:e.target.value}))}>
+                    <option value="">—</option>
+                    ${[1,2,3,4,5].map(n => html`<option key=${n} value=${n}>${n}</option>`)}
+                  </select>
+                </label>
+                <div className="flex gap-2">
+                  <button type="submit" className=${btnPrimary}>${editingId?"Guardar":"Añadir"}</button>
+                  ${editingId && html`<button type="button" onClick=${cancelEdit} className=${btnCls}>Cancelar</button>`}
+                </div>
+              </form>
+
+              <input className=${inputCls+" mb-3 w-full"} placeholder="Buscar por título, autor, categoría, subcategoría o ubicación" value=${query} onChange=${e=>setQuery(e.target.value)} />
+
+              <h3 className="text-xl font-semibold mt-8 mb-2">📖 Lista de títulos</h3>
+              <div className="flex items-center justify-between text-sm mb-2">
+                <div>Página ${page + 1} de ${totalPages} · Mostrando ${Math.min((page+1)*PAGE_SIZE, filtered.length)} de ${filtered.length}</div>
+                <div className="flex gap-2"><button className="px-3 py-2 rounded-xl bg-slate-900 text-white" onClick=${downloadPDF} title="Descargar catálogo en PDF">Descargar PDF</button> 
+                  <button className=${btnCls} onClick=${goPrev} disabled=${!canPrev} aria-label="Página anterior">◀</button>
+                  <button className=${btnCls} onClick=${goNext} disabled=${!canNext} aria-label="Página siguiente">▶</button>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto bg-white rounded-2xl shadow">
+                <table className="w-full text-left border-collapse">
+                  <thead>
+                    <tr className="bg-slate-100 text-slate-700">
+                      <th className="p-3 text-sm font-semibold">Código</th>
+                      <th className="p-3 text-sm font-semibold">Título</th>
+                      <th className="p-3 text-sm font-semibold">Autor</th>
+                      <th className="p-3 text-sm font-semibold">Editorial</th>
+                      <th className="p-3 text-sm font-semibold">Categoría</th>
+                      <th className="p-3 text-sm font-semibold">Subcategoría</th>
+                      <th className="p-3 text-sm font-semibold">Ubicación</th>
+                      <th className="p-3 text-sm font-semibold">Compra</th>
+                      <th className="p-3 text-sm font-semibold">⭐</th>
+                      <th className="p-3 text-sm font-semibold">Portada</th>
+                      <th className="p-3 text-sm font-semibold">Acciones</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${paged.map((x,i) => html`
+                      <tr key=${x.id || i} className="border-t">
+                        <td className="p-3 font-mono text-xs text-slate-600 whitespace-nowrap">
+                          <button className="underline underline-offset-2 text-slate-700 hover:text-slate-900" onClick=${()=>setSelected(x)} title="Ver ficha">${x.id}</button>
+                        </td>
+                        <td className="p-3">${x.titulo}</td>
+                        <td className="p-3">${x.autor}</td>
+                        <td className="p-3">${x.editorial}</td>
+                        <td className="p-3">${x.categoria}</td>
+                        <td className="p-3">${x.subcategoria || "—"}</td>
+                        <td className="p-3">${x.ubicacion || "—"}</td>
+                        <td className="p-3">${x.fechaCompra || "—"}</td>
+                        <td className="p-3">${x.rating ? "⭐".repeat(x.rating) : "—"}</td>
+                        <td className="p-3 w-[90px]">
+                          ${allowNet && x.portada
+                            ? html`<img src=${x.portada} alt=${x.titulo} className="h-20 w-16 object-cover rounded-md border" loading="lazy" referrerPolicy="no-referrer" />`
+                            : html`<div className="h-20 w-16 rounded-md border text-[10px] text-slate-400 flex items-center justify-center text-center px-1">${x.portada ? (allowNet ? "—" : "Desactivado") : "Sin portada"}</div>`}
+                        </td>
+                        <td className="p-3 whitespace-nowrap">
+                          <button className=${btnCls} onClick=${()=>startEdit(x.id)}>Editar</button>
+                          <button className=${btnCls+" text-red-600 ml-2"} onClick=${()=>removeItemBy(x.id, i)}>Borrar</button>
+                        </td>
+                      </tr>
+                    `)}
+                    ${filtered.length===0 && html`<tr><td colSpan="11" className="p-6 text-center text-slate-500">No hay resultados.</td></tr>`}
+                  </tbody>
+                </table>
+                <div className="flex items-center justify-between text-sm mt-2 mb-6">
+                  <div>Página ${page + 1} de ${totalPages} · Mostrando ${Math.min((page+1)*PAGE_SIZE, filtered.length)} de ${filtered.length}</div>
+                  <div className="flex gap-2">
+                    <button className=${btnCls} onClick=${goPrev} disabled=${!canPrev} aria-label="Página anterior">◀</button>
+                    <button className=${btnCls} onClick=${goNext} disabled=${!canNext} aria-label="Página siguiente">▶</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Copia de seguridad (JSON) -->
+              <div className="mt-6 border rounded-2xl p-3 bg-slate-50">
+                <div className="text-sm font-semibold mb-2">Copia de seguridad e importación (JSON)</div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                  <div className="flex gap-2 items-center">
+                    <span className="text-sm w-28">Biblioteca</span>
+                    <button type="button" className=${btnCls} onClick=${()=>exportJSON('items')}>Exportar</button>
+                    <button type="button" className=${btnCls} onClick=${()=>importJSON('items')}>Importar</button>
+                  </div>
+                  <div className="flex gap-2 items-center">
+                    <span className="text-sm w-28">Wishlist</span>
+                    <button type="button" className=${btnCls} onClick=${()=>exportJSON('wishlist')}>Exportar</button>
+                    <button type="button" className=${btnCls} onClick=${()=>importJSON('wishlist')}>Importar</button>
+                  </div>
+                  <div className="flex gap-2 items-center">
+                    <span className="text-sm w-28">Lecturas</span>
+                    <button type="button" className=${btnCls} onClick=${()=>exportJSON('reading')}>Exportar</button>
+                    <button type="button" className=${btnCls} onClick=${()=>importJSON('reading')}>Importar</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Exportación CSV -->
+              <div className="mt-8 border rounded-2xl p-3 bg-slate-50">
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <div className="text-sm font-semibold">Exportar CSV (separador punto y coma ;)</div>
+                  <div className="flex items-center gap-2">
+                    <button type="button" className=${btnCls} onClick=${()=>setShowFieldPicker(s=>!s)}>${showFieldPicker? 'Ocultar campos' : 'Elegir campos'}</button>
+                    <button type="button" className=${btnPrimary} onClick=${downloadCSV}>Descargar CSV</button>
+                  </div>
+                </div>
+                ${showFieldPicker && html`
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm">
+                    <label className="flex items-center gap-2"><input type="checkbox" checked=${selectedFields.length===allFields.length} onChange=${toggleAllFields} /> Seleccionar todo</label>
+                    ${allFields.map(f => html`
+                      <label key=${f} className="flex items-center gap-2">
+                        <input type="checkbox" checked=${selectedFields.includes(f)} onChange=${()=>toggleField(f)} /> ${f}
+                      </label>
+                    `)}
+                  </div>
+                `}
+              </div>
+
+            </div>
+
+            ${selected && html`
+              <div className="fixed inset-0 bg-black/50 backdrop-blur-[1px] flex items-center justify-center z-50" onClick=${()=>setSelected(null)}>
+                <div className="bg-white rounded-2xl shadow-xl max-w-xl w-[92%]" onClick=${e=>e.stopPropagation()}>
+                  <div className="p-4 border-b flex items-center justify-between">
+                    <h3 className="text-lg font-semibold">Ficha del libro</h3>
+                    <button className="px-3 py-1 rounded-lg border" onClick=${()=>setSelected(null)}>Cerrar</button>
+                  </div>
+                  <div className="p-4 grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div className="sm:col-span-1 flex items-start justify-center">
+                      <div className="w-28 h-40 rounded-md border bg-slate-100 flex items-center justify-center overflow-hidden">
+                        ${allowNet && selected.portada
+                          ? html`<img src=${selected.portada} alt=${selected.titulo} className="object-cover w-full h-full" />`
+                          : html`<span className="text-[10px] text-slate-400">Sin portada</span>`}
+                      </div>
+                    </div>
+                    <div className="sm:col-span-2 text-sm">
+                      <div className="mb-2"><span className="font-semibold">Código:</span> <span className="font-mono">${selected.id}</span></div>
+                      <div className="mb-2"><span className="font-semibold">Título:</span> ${selected.titulo || "—"}</div>
+                      <div className="mb-2"><span className="font-semibold">Autor:</span> ${selected.autor || "—"}</div>
+                      <div className="mb-2"><span className="font-semibold">Editorial:</span> ${selected.editorial || "—"}</div>
+                      <div className="mb-2"><span className="font-semibold">Categoría:</span> ${selected.categoria || "—"}</div>
+                      <div className="mb-2"><span className="font-semibold">Subcategoría:</span> ${selected.subcategoria || "—"}</div>
+                      <div className="mb-2"><span className="font-semibold">Ubicación:</span> ${selected.ubicacion || "—"}</div>
+                      <div className="mb-2"><span className="font-semibold">Fecha de alta:</span> ${selected.fecha ? new Date(selected.fecha).toLocaleString() : "—"}</div>
+                      <div className="mb-2"><span className="font-semibold">Fecha de compra:</span> ${selected.fechaCompra || "—"}</div>
+                      <div className="mb-2"><span className="font-semibold">Calificación:</span> ${selected.rating ? "⭐".repeat(selected.rating) : "—"}</div>
+                      <div className="mb-2">
+                        <div className="font-semibold">Resumen:</div>
+                        <div className="text-slate-700 whitespace-pre-wrap">${selected.resumen || "—"}</div>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="p-4 border-t flex items-center justify-end gap-2">
+                    <button className=${btnCls} onClick=${() => { setSelected(null); if (selected?.id) startEdit(selected.id); }}>Editar</button>
+                    <button className=${btnCls+" text-red-600"} onClick=${() => { removeItemBy(selected?.id); setSelected(null); }}>Borrar</button>
+                  </div>
+                </div>
+              </div>
+            `}
+          </div>
+        `;
+      }
+
+      const root = ReactDOM.createRoot(document.getElementById('root'));
+      root.render(html`<${App} />`);
+    </script>
+  </body>
+</html>
